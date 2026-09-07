@@ -27,6 +27,34 @@ fn response_format_maps_to_grammar() {
 }
 
 #[test]
+fn thinking_budget_maps_to_reply_config() {
+    let config = reply_config(r#"{"messages":[],"thinking_budget":128}"#);
+    assert_eq!(config.thinking_budget, Some(128));
+}
+
+#[test]
+fn thinking_budget_enables_thinking() {
+    let messages = messages_with_support(r#"{"messages":[],"thinking_budget":128}"#, ThinkingSupport::Toggle(false));
+    assert_eq!(messages[0].reasoning_effort(), Some(ReasoningEffort::Default));
+}
+
+#[test]
+fn thinking_budget_rejects_disabled_or_unsupported_thinking() {
+    for body in [
+        r#"{"messages":[],"thinking_budget":128,"enable_thinking":false}"#,
+        r#"{"messages":[],"thinking_budget":128,"reasoning_effort":"disabled"}"#,
+    ] {
+        let error = build_messages(&request(body), ThinkingSupport::Toggle(true))
+            .expect_err("thinking budget with disabled thinking should fail");
+        assert!(matches!(error, MessageBuildError::ThinkingBudget(_)));
+    }
+
+    let error = build_messages(&request(r#"{"messages":[],"thinking_budget":128}"#), ThinkingSupport::Unsupported)
+        .expect_err("unsupported models should reject thinking_budget");
+    assert!(matches!(error, MessageBuildError::ThinkingBudget(_)));
+}
+
+#[test]
 fn response_format_rejects_grammar_without_capability() {
     #[cfg(not(feature = "capability-grammar"))]
     {

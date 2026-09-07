@@ -6,6 +6,9 @@ use crate::types::basic::{Grammar, SamplingMethod, SamplingPolicy};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct ChatReplyConfig {
     pub token_limit: Option<u32>,
+    /// Maximum number of reasoning tokens before the engine forces the model's
+    /// end-of-thinking marker and continues with the final answer.
+    pub thinking_budget: Option<u32>,
     pub sampling_policy: SamplingPolicy,
     pub grammar: Option<Grammar>,
     /// Maximum number of automatic tool-call turns per reply.
@@ -30,6 +33,17 @@ impl ChatReplyConfig {
     ) -> Self {
         Self {
             token_limit,
+            ..self.clone()
+        }
+    }
+
+    #[bindings::export(Method)]
+    pub fn with_thinking_budget(
+        &self,
+        thinking_budget: Option<u32>,
+    ) -> Self {
+        Self {
+            thinking_budget,
             ..self.clone()
         }
     }

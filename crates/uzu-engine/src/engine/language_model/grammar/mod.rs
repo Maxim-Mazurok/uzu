@@ -10,15 +10,18 @@ use crate::{data_type::DataType, engine::language_model::grammar::engagement::Gr
 mod config;
 mod data_type;
 mod engagement;
+mod thinking_budget;
 
 pub use config::GrammarConfig;
+use thinking_budget::ThinkingBudget;
 
 // TODO: jumpforward?
 
 pub struct Grammar {
     vocab_size: usize,
-    matcher: GrammarMatcher,
+    matcher: Option<GrammarMatcher>,
     engagement_state: GrammarEngagementState,
+    thinking_budget: Option<ThinkingBudget>,
 }
 
 #[derive(Debug, Error)]
@@ -82,9 +85,35 @@ impl Grammar {
 
         Ok(Self {
             vocab_size,
-            matcher,
+            matcher: Some(matcher),
             engagement_state,
+            thinking_budget: None,
         })
+    }
+
+    pub fn thinking_budget(
+        budget: usize,
+        tokenizer: &Tokenizer,
+        end_sequence: Vec<u64>,
+        forced_sequence: Vec<u64>,
+    ) -> Self {
+        Self {
+            vocab_size: tokenizer.get_vocab_size(true),
+            matcher: None,
+            engagement_state: GrammarEngagementState::Always,
+            thinking_budget: Some(ThinkingBudget::new(budget, end_sequence, forced_sequence, tokenizer)),
+        }
+    }
+
+    pub fn with_thinking_budget(
+        mut self,
+        budget: usize,
+        tokenizer: &Tokenizer,
+        end_sequence: Vec<u64>,
+        forced_sequence: Vec<u64>,
+    ) -> Self {
+        self.thinking_budget = Some(ThinkingBudget::new(budget, end_sequence, forced_sequence, tokenizer));
+        self
     }
 }
 
@@ -96,7 +125,9 @@ impl Grammar {
         let vocab_size_in_u32s = self.vocab_size.div_ceil(DataType::U32.size_in_bits());
         assert!(bitmask.len() >= vocab_size_in_u32s); // NOTE: tokenizer vocab can be smaller than model vocab
 
-        if self.engagement_state.is_engaged() {
+        let mut constrained = if self.engagement_state.is_engaged()
+            && let Some(matcher) = self.matcher.as_mut()
+        {
             let mut shape_i64 = [vocab_size_in_u32s as i64];
             let mut bitmask_tensor = unsafe {
                 DLTensor::new(
@@ -118,29 +149,55 @@ impl Grammar {
             };
 
             bitmask[vocab_size_in_u32s..].fill(0);
-            self.matcher.fill_next_token_bitmask(&mut bitmask_tensor, 0, false)
+            matcher.fill_next_token_bitmask(&mut bitmask_tensor, 0, false)
         } else {
             bitmask.fill(u32::MAX);
 
             false
+        };
+
+        if let Some(token_id) = self.thinking_budget.as_mut().and_then(ThinkingBudget::next_forced_token) {
+            let token_id = token_id as usize;
+            assert!(token_id < self.vocab_size, "forced thinking marker token is outside the tokenizer vocabulary");
+            bitmask.fill(0);
+            bitmask[token_id / u32::BITS as usize] |= 1 << (token_id % u32::BITS as usize);
+            constrained = true;
         }
+
+        constrained
     }
 
     pub fn accept_token(
         &mut self,
         token_id: u64,
     ) -> Result<(), GrammarError> {
+        // Speculators propose tokens before the target sampler applies the
+        // bitmask. Reject branches that do not follow a pending forced marker.
+        // Forced transition whitespace is protocol syntax rather than final
+        // output, so do not feed it to a response-format matcher.
+        let forced_token = self.thinking_budget.as_mut().and_then(ThinkingBudget::next_forced_token);
+        if forced_token.is_some_and(|forced_token| forced_token != token_id) {
+            return Err(GrammarError::GrammarReject);
+        }
+
         // A terminated matcher cannot advance and its bitmask only allows stop
         // tokens, which close generation without being part of the grammar, so
         // tokens sampled after termination must not be rejected.
-        if self.engagement_state.is_engaged()
-            && !self.matcher.is_terminated()
-            && !self.matcher.accept_token(token_id as i32)
+        if forced_token.is_none()
+            && self.engagement_state.is_engaged()
+            && let Some(matcher) = self.matcher.as_mut()
+            && !matcher.is_terminated()
+            && !matcher.accept_token(token_id as i32)
         {
             return Err(GrammarError::GrammarReject);
         }
 
         self.engagement_state.accept_token(token_id);
+        if let Some(thinking_budget) = self.thinking_budget.as_mut() {
+            if thinking_budget.accept_token(token_id) {
+                self.engagement_state.force_engage();
+            }
+        }
         Ok(())
     }
 
@@ -151,11 +208,16 @@ impl Grammar {
         let num_grammar_tokens = self.engagement_state.rollback(num_tokens);
 
         if num_grammar_tokens > 0 {
-            self.matcher.rollback(num_grammar_tokens as i32);
+            if let Some(matcher) = self.matcher.as_mut() {
+                matcher.rollback(num_grammar_tokens as i32);
+            }
+        }
+        if let Some(thinking_budget) = self.thinking_budget.as_mut() {
+            thinking_budget.rollback(num_tokens);
         }
     }
 
     pub fn is_terminated(&self) -> bool {
-        self.matcher.is_terminated()
+        self.matcher.as_ref().is_some_and(GrammarMatcher::is_terminated)
     }
 }

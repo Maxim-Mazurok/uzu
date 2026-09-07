@@ -75,3 +75,13 @@ fn rollback_past_the_start_is_safe() {
     assert_eq!(state.rollback(5), 0);
     assert!(!state.is_engaged());
 }
+
+#[uzu_test]
+fn forced_engagement_rolls_back_with_its_token() {
+    let mut state = triggered();
+    state.accept_token(11);
+    state.force_engage();
+    assert!(state.is_engaged());
+    assert_eq!(state.rollback(1), 0);
+    assert!(!state.is_engaged());
+}

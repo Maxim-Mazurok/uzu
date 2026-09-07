@@ -96,6 +96,9 @@ pub struct ChatCompletionRequest {
     pub max_tokens: Option<u32>,
     #[serde(default)]
     pub max_completion_tokens: Option<u32>,
+    /// Maximum reasoning tokens before forcing the model into its final answer.
+    #[serde(default)]
+    pub thinking_budget: Option<u32>,
     #[serde(default)]
     pub temperature: Option<f64>,
     #[serde(default)]
@@ -278,6 +281,7 @@ pub(crate) enum MessageBuildError {
     ReasoningEffort(String),
     EnableThinking(String),
     ChatTemplateKwargs(String),
+    ThinkingBudget(String),
 }
 
 impl MessageBuildError {
@@ -287,6 +291,7 @@ impl MessageBuildError {
             Self::ReasoningEffort(_) => "reasoning_effort",
             Self::EnableThinking(_) => "enable_thinking",
             Self::ChatTemplateKwargs(_) => "chat_template_kwargs",
+            Self::ThinkingBudget(_) => "thinking_budget",
         }
     }
 
@@ -296,6 +301,7 @@ impl MessageBuildError {
             Self::ReasoningEffort(_) => "invalid_reasoning_effort",
             Self::EnableThinking(_) => "invalid_enable_thinking",
             Self::ChatTemplateKwargs(_) => "invalid_chat_template_kwargs",
+            Self::ThinkingBudget(_) => "invalid_thinking_budget",
         }
     }
 
@@ -304,7 +310,8 @@ impl MessageBuildError {
             Self::ToolChoice(detail)
             | Self::ReasoningEffort(detail)
             | Self::EnableThinking(detail)
-            | Self::ChatTemplateKwargs(detail) => detail,
+            | Self::ChatTemplateKwargs(detail)
+            | Self::ThinkingBudget(detail) => detail,
         }
     }
 }
@@ -362,6 +369,7 @@ fn parse_enable_thinking(request: &ChatCompletionRequest) -> Result<Option<bool>
 enum ReasoningSource {
     ReasoningEffort,
     EnableThinking,
+    ThinkingBudget,
 }
 
 impl ReasoningSource {
@@ -372,6 +380,7 @@ impl ReasoningSource {
         match self {
             Self::ReasoningEffort => MessageBuildError::ReasoningEffort(detail),
             Self::EnableThinking => MessageBuildError::EnableThinking(detail),
+            Self::ThinkingBudget => MessageBuildError::ThinkingBudget(detail),
         }
     }
 }
@@ -381,6 +390,9 @@ fn requested_reasoning_effort(
 ) -> Result<Option<(ReasoningEffort, ReasoningSource)>, MessageBuildError> {
     let explicit = parse_reasoning_effort(request).map_err(MessageBuildError::ReasoningEffort)?;
     let enable = parse_enable_thinking(request)?;
+    if request.thinking_budget.is_some() && (explicit == Some(ReasoningEffort::Disabled) || enable == Some(false)) {
+        return Err(MessageBuildError::ThinkingBudget("thinking_budget requires thinking to be enabled".to_string()));
+    }
     match (explicit, enable) {
         (Some(effort), Some(enable)) if (effort == ReasoningEffort::Disabled) == enable => {
             Err(MessageBuildError::ReasoningEffort(format!(
@@ -395,6 +407,9 @@ fn requested_reasoning_effort(
                 ReasoningEffort::Disabled
             };
             Ok(Some((toggled, ReasoningSource::EnableThinking)))
+        },
+        (None, None) if request.thinking_budget.is_some() => {
+            Ok(Some((ReasoningEffort::Default, ReasoningSource::ThinkingBudget)))
         },
         (None, None) => Ok(None),
     }
@@ -521,7 +536,8 @@ fn validate_sampling(request: &ChatCompletionRequest) -> Result<(), (&'static st
 
 fn build_reply_config(request: &ChatCompletionRequest) -> Result<ChatReplyConfig, ResponseFormatError> {
     let token_limit = request.max_completion_tokens.or(request.max_tokens);
-    let mut config = ChatReplyConfig::default().with_token_limit(token_limit);
+    let mut config =
+        ChatReplyConfig::default().with_token_limit(token_limit).with_thinking_budget(request.thinking_budget);
 
     if request.temperature.is_some_and(|temperature| temperature <= 0.0) {
         config = config.with_sampling_method(SamplingMethod::Greedy {});

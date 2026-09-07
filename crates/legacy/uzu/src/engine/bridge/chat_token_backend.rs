@@ -134,24 +134,78 @@ impl<B: Backend> BackendInstance for UzuChatTokenBackendInstance<B> {
         let token_limit = config.token_limit.map(|count| count as usize);
 
         #[cfg(feature = "capability-grammar")]
-        let grammar = if let Some(grammar_config) = config.grammar {
+        let grammar = {
             let trigger_token_sequence = grammar_trigger_token_sequence_for_prompt(
                 self.grammar_trigger_token_sequence.as_deref(),
                 input,
                 self.model.tokenizer(),
             );
-            match get_grammar(grammar_config, self.model.tokenizer(), &self.stop_token_ids, trigger_token_sequence) {
-                Ok(grammar) => Some(grammar),
-                Err(err) => {
-                    return Box::pin(NoMetricsStream::new(error_stream(err.to_string())));
-                },
+            let mut grammar = if let Some(grammar_config) = config.grammar {
+                match get_grammar(
+                    grammar_config,
+                    self.model.tokenizer(),
+                    &self.stop_token_ids,
+                    trigger_token_sequence.clone(),
+                ) {
+                    Ok(grammar) => Some(grammar),
+                    Err(err) => {
+                        return Box::pin(NoMetricsStream::new(error_stream(err.to_string())));
+                    },
+                }
+            } else {
+                None
+            };
+            if let Some(thinking_budget) = config.thinking_budget {
+                let Some(end_sequence) = trigger_token_sequence else {
+                    return Box::pin(NoMetricsStream::new(error_stream(
+                        "thinking_budget requires a model with active thinking support".to_string(),
+                    )));
+                };
+                let Some(end_tag) = self.model.end_of_thinking_tag() else {
+                    return Box::pin(NoMetricsStream::new(error_stream(
+                        "thinking_budget requires a configured end-of-thinking marker".to_string(),
+                    )));
+                };
+                // Match the model template's transition. This can tokenize
+                // differently from the bare marker; Grammar::accept_token
+                // explicitly engages response constraints when it completes.
+                let forced_sequence = match self.model.tokenizer().encode(format!("\n{end_tag}\n\n"), false) {
+                    Ok(encoding) if !encoding.is_empty() => {
+                        encoding.get_ids().iter().copied().map(u64::from).collect::<Vec<_>>()
+                    },
+                    Ok(_) => {
+                        return Box::pin(NoMetricsStream::new(error_stream(
+                            "the model's end-of-thinking transition encodes to no tokens".to_string(),
+                        )));
+                    },
+                    Err(err) => {
+                        return Box::pin(NoMetricsStream::new(error_stream(format!(
+                            "failed to encode the model's end-of-thinking transition: {err}"
+                        ))));
+                    },
+                };
+                grammar = Some(match grammar {
+                    Some(grammar) => grammar.with_thinking_budget(
+                        thinking_budget as usize,
+                        self.model.tokenizer(),
+                        end_sequence,
+                        forced_sequence,
+                    ),
+                    None => uzu_engine::engine::language_model::grammar::Grammar::thinking_budget(
+                        thinking_budget as usize,
+                        self.model.tokenizer(),
+                        end_sequence,
+                        forced_sequence,
+                    ),
+                });
             }
-        } else {
-            None
+            grammar
         };
         #[cfg(not(feature = "capability-grammar"))]
-        if config.grammar.is_some() {
-            return Box::pin(NoMetricsStream::new(error_stream("Grammar is not supported by this build".to_string())));
+        if config.grammar.is_some() || config.thinking_budget.is_some() {
+            return Box::pin(NoMetricsStream::new(error_stream(
+                "Grammar and thinking_budget are not supported by this build".to_string(),
+            )));
         }
 
         let mut options = self.model.default_stream_options();

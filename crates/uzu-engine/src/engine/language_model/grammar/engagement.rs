@@ -66,6 +66,20 @@ impl GrammarEngagementState {
         }
     }
 
+    /// Engage after a synthetic reasoning transition whose tokenization does
+    /// not contain the model's bare trigger sequence. The current history entry
+    /// carries this state so speculative rollback restores the prior state.
+    pub fn force_engage(&mut self) {
+        if let Self::Triggered {
+            trigger_sequence,
+            match_history,
+        } = self
+            && let Some(matched) = match_history.last_mut()
+        {
+            *matched = trigger_sequence.len();
+        }
+    }
+
     pub fn rollback(
         &mut self,
         num_tokens: usize,
