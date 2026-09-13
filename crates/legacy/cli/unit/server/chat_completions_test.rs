@@ -6,12 +6,29 @@ fn request(json: &str) -> ChatCompletionRequest {
 }
 
 fn reply_config(json: &str) -> ChatReplyConfig {
-    build_reply_config(&request(json)).expect("valid reply config")
+    let request = request(json);
+    build_reply_config(&request, request.thinking_budget).expect("valid reply config")
 }
 
 #[cfg(not(feature = "capability-grammar"))]
 fn reply_config_error(json: &str) -> ResponseFormatError {
-    build_reply_config(&request(json)).expect_err("invalid reply config")
+    let request = request(json);
+    build_reply_config(&request, request.thinking_budget).expect_err("invalid reply config")
+}
+
+#[test]
+fn consecutive_assistant_messages_are_merged_for_openai_compatibility() {
+    let request = request(
+        r#"{"messages":[{"role":"user","content":"start"},{"role":"assistant","content":"summary"},{"role":"assistant","content":"retained tail","reasoning_content":"continued reasoning","tool_calls":[{"id":"call_1","type":"function","function":{"name":"bash","arguments":"{\"cmd\":\"pwd\"}"}}]},{"role":"tool","tool_call_id":"call_1","content":"/tmp"},{"role":"user","content":"continue"}]}"#,
+    );
+    let messages = to_chat_messages(&request.messages);
+
+    assert_eq!(messages.len(), 4);
+    assert_eq!(messages[1].role, ChatRole::Assistant {});
+    assert_eq!(messages[1].reasoning().as_deref(), Some("continued reasoning"));
+    assert_eq!(messages[1].text().as_deref(), Some("summary\n\nretained tail"));
+    assert_eq!(messages[1].tool_calls().len(), 1);
+    assert_eq!(messages[2].role, ChatRole::Tool {});
 }
 
 #[test]
@@ -34,24 +51,34 @@ fn thinking_budget_maps_to_reply_config() {
 
 #[test]
 fn thinking_budget_enables_thinking() {
-    let messages = messages_with_support(r#"{"messages":[],"thinking_budget":128}"#, ThinkingSupport::Toggle(false));
+    let request = request(r#"{"messages":[],"thinking_budget":128}"#);
+    let (messages, thinking_budget) =
+        build_messages_and_thinking_budget(&request, ThinkingSupport::Toggle(false)).expect("valid request");
     assert_eq!(messages[0].reasoning_effort(), Some(ReasoningEffort::Default));
+    assert_eq!(thinking_budget, Some(128));
 }
 
 #[test]
-fn thinking_budget_rejects_disabled_or_unsupported_thinking() {
+fn thinking_budget_is_ignored_for_disabled_or_unsupported_thinking() {
     for body in [
         r#"{"messages":[],"thinking_budget":128,"enable_thinking":false}"#,
+        r#"{"messages":[],"thinking_budget":128,"enable_thinking":false,"chat_template_kwargs":{"enable_thinking":false}}"#,
         r#"{"messages":[],"thinking_budget":128,"reasoning_effort":"disabled"}"#,
     ] {
-        let error = build_messages(&request(body), ThinkingSupport::Toggle(true))
-            .expect_err("thinking budget with disabled thinking should fail");
-        assert!(matches!(error, MessageBuildError::ThinkingBudget(_)));
+        let request = request(body);
+        let (messages, thinking_budget) =
+            build_messages_and_thinking_budget(&request, ThinkingSupport::Toggle(true)).expect("valid request");
+        assert_eq!(messages[0].reasoning_effort(), Some(ReasoningEffort::Disabled));
+        assert_eq!(thinking_budget, None);
+        assert_eq!(build_reply_config(&request, thinking_budget).expect("valid reply config").thinking_budget, None);
     }
 
-    let error = build_messages(&request(r#"{"messages":[],"thinking_budget":128}"#), ThinkingSupport::Unsupported)
-        .expect_err("unsupported models should reject thinking_budget");
-    assert!(matches!(error, MessageBuildError::ThinkingBudget(_)));
+    let request = request(r#"{"messages":[],"thinking_budget":128}"#);
+    let (messages, thinking_budget) =
+        build_messages_and_thinking_budget(&request, ThinkingSupport::Unsupported).expect("valid request");
+    assert!(messages.iter().all(|message| message.reasoning_effort().is_none()));
+    assert_eq!(thinking_budget, None);
+    assert_eq!(build_reply_config(&request, thinking_budget).expect("valid reply config").thinking_budget, None);
 }
 
 #[test]
@@ -73,7 +100,7 @@ fn response_format_rejects_grammar_without_capability() {
 
 #[test]
 fn response_format_unrecognized_is_invalid() {
-    let error = build_reply_config(&request(r#"{"messages":[],"response_format":{"type":"totally-bogus"}}"#))
+    let error = build_reply_config(&request(r#"{"messages":[],"response_format":{"type":"totally-bogus"}}"#), None)
         .expect_err("unrecognized response_format should be rejected");
     assert!(
         matches!(error, ResponseFormatError::InvalidResponseFormat(_)),
@@ -97,9 +124,12 @@ fn response_format_json_schema_maps_to_grammar() {
 
 #[test]
 fn response_format_json_schema_rejects_invalid_schema() {
-    let error = build_reply_config(&request(
-        r#"{"messages":[],"response_format":{"type":"json_schema","json_schema":{"schema":{"type":"not-a-json-schema-type"}}}}"#,
-    ))
+    let error = build_reply_config(
+        &request(
+            r#"{"messages":[],"response_format":{"type":"json_schema","json_schema":{"schema":{"type":"not-a-json-schema-type"}}}}"#,
+        ),
+        None,
+    )
     .expect_err("an invalid JSON Schema should be rejected");
     assert!(matches!(error, ResponseFormatError::InvalidJsonSchema(_)), "expected InvalidJsonSchema, got {error:?}");
     assert_eq!(error.code(), "invalid_json_schema");

@@ -249,8 +249,42 @@ fn now_unix() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
+fn append_message_text(
+    target: &mut Option<String>,
+    source: &Option<String>,
+) {
+    let Some(source) = source.as_ref().filter(|text| !text.is_empty()) else {
+        return;
+    };
+    match target {
+        Some(target) if !target.is_empty() => {
+            target.push_str("\n\n");
+            target.push_str(source);
+        },
+        Some(target) => target.push_str(source),
+        None => *target = Some(source.clone()),
+    }
+}
+
 fn to_chat_messages(messages: &[OaiMessage]) -> Vec<ChatMessage> {
-    messages
+    let mut normalized: Vec<OaiMessage> = Vec::with_capacity(messages.len());
+    for message in messages {
+        if message.role == "assistant"
+            && let Some(previous) = normalized.last_mut()
+            && previous.role == "assistant"
+            && previous.tool_calls.as_ref().is_none_or(Vec::is_empty)
+        {
+            append_message_text(&mut previous.reasoning_content, &message.reasoning_content);
+            append_message_text(&mut previous.content, &message.content);
+            if let Some(tool_calls) = &message.tool_calls {
+                previous.tool_calls.get_or_insert_default().extend(tool_calls.clone());
+            }
+            continue;
+        }
+        normalized.push(message.clone());
+    }
+
+    normalized
         .iter()
         .map(|message| {
             let role = ChatRole::from_str(&message.role).unwrap_or(ChatRole::User {});
@@ -385,44 +419,47 @@ impl ReasoningSource {
     }
 }
 
-fn requested_reasoning_effort(
-    request: &ChatCompletionRequest
-) -> Result<Option<(ReasoningEffort, ReasoningSource)>, MessageBuildError> {
+fn requested_reasoning(
+    request: &ChatCompletionRequest,
+    thinking_support: ThinkingSupport,
+) -> Result<(Option<(ReasoningEffort, ReasoningSource)>, Option<u32>), MessageBuildError> {
     let explicit = parse_reasoning_effort(request).map_err(MessageBuildError::ReasoningEffort)?;
     let enable = parse_enable_thinking(request)?;
-    if request.thinking_budget.is_some() && (explicit == Some(ReasoningEffort::Disabled) || enable == Some(false)) {
-        return Err(MessageBuildError::ThinkingBudget("thinking_budget requires thinking to be enabled".to_string()));
-    }
-    match (explicit, enable) {
+    let requested = match (explicit, enable) {
         (Some(effort), Some(enable)) if (effort == ReasoningEffort::Disabled) == enable => {
-            Err(MessageBuildError::ReasoningEffort(format!(
+            return Err(MessageBuildError::ReasoningEffort(format!(
                 "reasoning_effort {effort} conflicts with enable_thinking {enable}"
-            )))
+            )));
         },
-        (Some(effort), _) => Ok(Some((effort, ReasoningSource::ReasoningEffort))),
+        (Some(effort), _) => Some((effort, ReasoningSource::ReasoningEffort)),
         (None, Some(enable)) => {
             let toggled = if enable {
                 ReasoningEffort::Default
             } else {
                 ReasoningEffort::Disabled
             };
-            Ok(Some((toggled, ReasoningSource::EnableThinking)))
+            Some((toggled, ReasoningSource::EnableThinking))
         },
-        (None, None) if request.thinking_budget.is_some() => {
-            Ok(Some((ReasoningEffort::Default, ReasoningSource::ThinkingBudget)))
+        (None, None) if request.thinking_budget.is_some() && thinking_support != ThinkingSupport::Unsupported => {
+            Some((ReasoningEffort::Default, ReasoningSource::ThinkingBudget))
         },
-        (None, None) => Ok(None),
-    }
+        (None, None) => None,
+    };
+    let thinking_disabled = requested.is_some_and(|(effort, _)| effort == ReasoningEffort::Disabled)
+        || thinking_support == ThinkingSupport::Unsupported;
+    let thinking_budget = (!thinking_disabled).then_some(request.thinking_budget).flatten();
+    Ok((requested, thinking_budget))
 }
 
-pub(crate) fn build_messages(
+fn build_messages_and_thinking_budget(
     request: &ChatCompletionRequest,
     thinking_support: ThinkingSupport,
-) -> Result<Vec<ChatMessage>, MessageBuildError> {
+) -> Result<(Vec<ChatMessage>, Option<u32>), MessageBuildError> {
     let tools =
         choose_tools(request.tools.as_deref(), request.tool_choice.as_ref()).map_err(MessageBuildError::ToolChoice)?;
     let mut messages = to_chat_messages(&request.messages);
-    if let Some((effort, source)) = requested_reasoning_effort(request)? {
+    let (requested_reasoning, thinking_budget) = requested_reasoning(request, thinking_support)?;
+    if let Some((effort, source)) = requested_reasoning {
         let fulfilled = thinking_support.fulfill_requested_effort(effort).map_err(|detail| source.error(detail))?;
         if let Some(effort) = fulfilled {
             // The engine reads the effort from a reasoning_effort block carried on a system
@@ -438,7 +475,14 @@ pub(crate) fn build_messages(
     }
     backfill_tool_result_names(&mut messages);
     insert_tools_message(&mut messages, &tools);
-    Ok(messages)
+    Ok((messages, thinking_budget))
+}
+
+pub(crate) fn build_messages(
+    request: &ChatCompletionRequest,
+    thinking_support: ThinkingSupport,
+) -> Result<Vec<ChatMessage>, MessageBuildError> {
+    build_messages_and_thinking_budget(request, thinking_support).map(|(messages, _)| messages)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -534,10 +578,12 @@ fn validate_sampling(request: &ChatCompletionRequest) -> Result<(), (&'static st
     Ok(())
 }
 
-fn build_reply_config(request: &ChatCompletionRequest) -> Result<ChatReplyConfig, ResponseFormatError> {
+fn build_reply_config(
+    request: &ChatCompletionRequest,
+    thinking_budget: Option<u32>,
+) -> Result<ChatReplyConfig, ResponseFormatError> {
     let token_limit = request.max_completion_tokens.or(request.max_tokens);
-    let mut config =
-        ChatReplyConfig::default().with_token_limit(token_limit).with_thinking_budget(request.thinking_budget);
+    let mut config = ChatReplyConfig::default().with_token_limit(token_limit).with_thinking_budget(thinking_budget);
 
     if request.temperature.is_some_and(|temperature| temperature <= 0.0) {
         config = config.with_sampling_method(SamplingMethod::Greedy {});
@@ -1206,21 +1252,21 @@ pub async fn handle_chat_completions(
         log.fail(&message);
         return invalid_request_response(param, "out_of_range", message);
     }
-    let config = match build_reply_config(&request) {
-        Ok(config) => config,
-        Err(error) => {
-            log.fail(&error.message());
-            return invalid_request_response("response_format", error.code(), error.message());
-        },
-    };
-    let messages = match build_messages(&request, state.thinking_support) {
-        Ok(messages) => messages,
+    let (messages, thinking_budget) = match build_messages_and_thinking_budget(&request, state.thinking_support) {
+        Ok(result) => result,
         Err(error) => {
             let param = error.param();
             let code = error.code();
             let detail = error.into_detail();
             log.fail(&detail);
             return invalid_request_response(param, code, detail);
+        },
+    };
+    let config = match build_reply_config(&request, thinking_budget) {
+        Ok(config) => config,
+        Err(error) => {
+            log.fail(&error.message());
+            return invalid_request_response("response_format", error.code(), error.message());
         },
     };
 
